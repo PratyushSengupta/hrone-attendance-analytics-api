@@ -81,24 +81,81 @@ def truncate_to_seconds(value: datetime) -> datetime:
     """Remove fractional seconds before attendance calculations."""
     return value.replace(microsecond=0)
 
+def to_epoch_ms(value):
+    """Convert BSON/Python datetime values to epoch milliseconds."""
+    if not isinstance(value, datetime):
+        return value
 
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+
+    return int(value.timestamp() * 1000)
+
+
+def serialize_history(history):
+    """Serialize timestamps in history entries and their changes."""
+    serialized = []
+
+    for entry in history or []:
+        item = dict(entry)
+
+        if "at" in item:
+            item["at"] = to_epoch_ms(item["at"])
+
+        changes = item.get("changes")
+        if isinstance(changes, dict):
+            converted_changes = {}
+
+            for field, change in changes.items():
+                if isinstance(change, dict):
+                    converted_changes[field] = {
+                        key: to_epoch_ms(value)
+                        for key, value in change.items()
+                    }
+                else:
+                    converted_changes[field] = to_epoch_ms(change)
+
+            item["changes"] = converted_changes
+
+        serialized.append(item)
+
+    return serialized
+
+
+
+def compute_late_minutes(
+    punch_in: datetime,
+    shift_start: str,
+    attendance_date: str,
+) -> int:
     punch_in = truncate_to_seconds(punch_in)
 
-    h, m = map(int, shift_start.split(":"))
-    shift_start_at = punch_in.replace(
-        hour=h, minute=m, second=0, microsecond=0
+    if punch_in.tzinfo is None:
+        punch_in = punch_in.replace(tzinfo=IST)
+    else:
+        punch_in = punch_in.astimezone(IST)
+
+    shift_day = date.fromisoformat(attendance_date)
+    hour, minute = map(int, shift_start.split(":"))
+
+    shift_start_at = datetime(
+        shift_day.year,
+        shift_day.month,
+        shift_day.day,
+        hour,
+        minute,
+        tzinfo=IST,
     )
 
     elapsed_seconds = int(
         (punch_in - shift_start_at).total_seconds()
     )
 
-    # The 10-minute grace period is not considered late.
     if elapsed_seconds <= 10 * 60:
         return 0
 
     return elapsed_seconds // 60
+
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
@@ -434,8 +491,9 @@ def punch_in(body: PunchInIn):
     )
 
     late_minutes = compute_late_minutes(
-    punch_in_ist.replace(tzinfo=None),
-    shift_start
+    punch_in_ist,
+    shift_start,
+    date_str,
 )
 
     doc = {
@@ -731,8 +789,9 @@ def regularize_attendance(
         half_day = False
     else:
         late_minutes = compute_late_minutes(
-            new_in.astimezone(IST).replace(tzinfo=None),
-            emp["shift_start"],
+                new_in,
+                emp["shift_start"],
+                parsed_date.isoformat(),
         )
         if new_out is None:
             work_hours = None
@@ -842,12 +901,9 @@ def regularize_attendance(
                 value = value.replace(tzinfo=timezone.utc)
             updated[field] = int(value.timestamp() * 1000)
 
-    for entry in updated.get("history", []):
-        if isinstance(entry.get("at"), datetime):
-            value = entry["at"]
-            if value.tzinfo is None:
-                value = value.replace(tzinfo=timezone.utc)
-            entry["at"] = int(value.timestamp() * 1000)
+    updated["history"] = serialize_history(
+        updated.get("history", [])
+    )
 
     return updated
 
